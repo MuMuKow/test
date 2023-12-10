@@ -118,6 +118,7 @@ void kernel(const char* command) {
     //    [0,PROC_START_ADDR). This is indicated in the lab description,
     //    and we repeat it in this hint.
 
+    // Set up kernel isolation so that processes can't access kernel memory except for console
     virtual_memory_map(kernel_pagetable, 0, 0, PROC_START_ADDR, PTE_P | PTE_W);
     virtual_memory_map(kernel_pagetable, (uintptr_t)console, (uintptr_t)console, PAGESIZE, PTE_P | PTE_W | PTE_U);
 
@@ -138,32 +139,39 @@ void kernel(const char* command) {
 //    allocate it to the given owner. This function fails if there is no
 //    free physical page. Returns the page address on success and 0 on
 //    failure. 
-uintptr_t find_free_page(pageowner_t owner)
-{
-     for(int i = 0; i < PAGENUMBER(MEMSIZE_PHYSICAL); i++){
+uintptr_t find_free_page(pageowner_t owner) {
+    // Loop through pageinfo to find a free page and then set its refcount to 1 and owner to owner
+    for(int i = 0; i < PAGENUMBER(MEMSIZE_PHYSICAL); i++){
         if (pageinfo[i].refcount == 0){
             pageinfo[i].refcount = 1;
             pageinfo[i].owner = owner;
             return PAGEADDRESS(i);
         }
     }
-
-    return (uintptr_t)-1;
+    return 0;
 }
 
-x86_pagetable* copy_pagetable(x86_pagetable* pagedir, int8_t owner)
-{
+// copy_pagetable(pagedir, owner)
+//    The purpose of this function is to set up a two-level page table
+//    for a new process. This function fails if there is no free physical
+//    page. Returns the level-1 page table address on success and 0 on
+//    failure.
+x86_pagetable* copy_pagetable(x86_pagetable* pagedir, int8_t owner) {
+    // Allocate a new level-1 page table and a new level-2 page table
     x86_pagetable* l1_pagetable = (x86_pagetable*)find_free_page(owner);
-    if(l1_pagetable == (x86_pagetable*)-1) return (x86_pagetable*)-1;
     x86_pagetable* l2_pagetable = (x86_pagetable*)find_free_page(owner);
-    if(l2_pagetable == (x86_pagetable*)-1) return (x86_pagetable*)-1;
 
+    // Return 0 if no free page was found
+    if(l1_pagetable == 0 || l2_pagetable == 0) return 0;
+
+    // Set the first entry of the level-1 page table to point to the level-2 page table
     l1_pagetable->entry[0] = (x86_pageentry_t)l2_pagetable | PTE_P | PTE_W | PTE_U;
     // Zero out the rest of the level-1 page table
-    for (int i = 1; i < PAGETABLE_NENTRIES; ++i)
+    for (int i = 1; i < PAGETABLE_NENTRIES; ++i) {
         l1_pagetable->entry[i] = 0;
+    }
 
-    
+    // Copy the kernel page table into the level-2 page table up to PROC_START_ADDR
     memcpy(l2_pagetable->entry, (void*)PTE_ADDR(pagedir->entry[0]), PAGESIZE);
 
     return l1_pagetable;
@@ -179,8 +187,13 @@ void process_setup(pid_t pid, int program_number) {
     process_init(&processes[pid], 0);
 
     // Exercise 2: your code here
+    // Copy the kernel page table into the process's page table
     processes[pid].p_pagetable = copy_pagetable(kernel_pagetable, pid);
-    assert(processes[pid].p_pagetable != (x86_pagetable*)-1);
+    // If no free page was found, physical memory is full
+    if (processes[pid].p_pagetable == 0) {
+        panic("Out of physical memory!\n");
+    }
+    // Zero out the rest of the level-2 page table
     x86_pagetable* l2_pagetable = (x86_pagetable*)PTE_ADDR(processes[pid].p_pagetable->entry[0]);
     memset(&l2_pagetable->entry[PAGENUMBER(PROC_START_ADDR)], 0, PAGESIZE - sizeof(x86_pageentry_t) * PAGENUMBER(PROC_START_ADDR));
     
@@ -188,11 +201,15 @@ void process_setup(pid_t pid, int program_number) {
     assert(r >= 0);
 
     // Exercise 4: your code here
+    // Change processes' stack to start at MEMSIZE_VIRTUAL
     processes[pid].p_registers.reg_esp = MEMSIZE_VIRTUAL;
     uintptr_t stack_page = processes[pid].p_registers.reg_esp - PAGESIZE;
     // Find a free physical page and map it at the page below the stack.
     uintptr_t free_page = find_free_page(pid);
-    assert(free_page != (uintptr_t)-1);
+    // If no free page was found, physical memory is full
+    if (free_page == 0) {
+        panic("Out of physical memory!\n");
+    }
     virtual_memory_map(processes[pid].p_pagetable, stack_page, free_page,
                        PAGESIZE, PTE_P|PTE_W|PTE_U);
     processes[pid].p_state = P_RUNNABLE;
@@ -275,17 +292,22 @@ void exception(x86_registers* reg) {
         //   under PROC_START_ADDR or to the page right before MEMSIZE_VIRTUAL
         //   (which would be used as the process's stack later)
 
+        // Check if address is valid
         if(addr < PROC_START_ADDR || addr >= MEMSIZE_VIRTUAL - PAGESIZE) {
             current->p_registers.reg_eax = -1;
             break;
         }
 
         // Exercise 3: your code here
+
+        // Find a free physical page
         uintptr_t free_page = find_free_page(current->p_pid);
-        if(free_page == (uintptr_t)-1) {
+        // If no free page was found, return -1
+        if(free_page == 0) {
             current->p_registers.reg_eax = -1;
             break;
         }
+        // Map the free page to the given virtual address and return 0
         virtual_memory_map(current->p_pagetable, addr, free_page, PAGESIZE, PTE_P|PTE_W|PTE_U);
         current->p_registers.reg_eax = 0;
         break;
@@ -342,8 +364,9 @@ int fork(void) {
         return -1;
 
     // Exercise 5: your code here
+    // Copy page table of current process into child process
     processes[pid].p_pagetable = copy_pagetable(current->p_pagetable, pid);
-    if (processes[pid].p_pagetable == (x86_pagetable*)-1) {
+    if (processes[pid].p_pagetable == 0) {
         panic("Out of physical memory!\n");
     }
 
@@ -354,7 +377,7 @@ int fork(void) {
         if (vam.perm & PTE_W) {
             // Allocate a new page for the child process
             uintptr_t free_page = find_free_page(pid);
-            if (free_page == (uintptr_t)-1) {
+            if (free_page == 0) {
                 panic("Out of physical memory!\n");
             }
             // Copy the contents of the parent page to the child page
